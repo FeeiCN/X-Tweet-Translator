@@ -101,7 +101,7 @@ async function setupContextMenus() {
 
   chrome.contextMenus.create({
     id: CONTEXT_MENU_SEND_IMAGE_TO_GROK,
-    title: 'Send image to Grok',
+    title: '让Grok分析图片内容',
     contexts: ['image']
   });
 }
