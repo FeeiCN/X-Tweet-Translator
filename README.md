@@ -7,6 +7,7 @@
 ## 图片预览
 
 ![X Tweet Translator Screenshot](./ScreenShot_X-Tweet-Translator.png)
+![X Tweet Translator Popup](./ScreenShot_popup.png)
 
 ## 当前功能
 
