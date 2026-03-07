@@ -45,25 +45,15 @@ async function scanTweets() {
 
   hideAdTweets();
 
-  const tweetTextBlocks = document.querySelectorAll('[data-testid="tweetText"]');
-
-  for (const textBlock of tweetTextBlocks) {
-    if (textBlock.dataset.xTranslateBound === '1') {
-      continue;
-    }
-
-    if (isChineseText(textBlock.innerText || '')) {
-      textBlock.dataset.xTranslateBound = '1';
-      continue;
-    }
-
-    textBlock.dataset.xTranslateBound = '1';
-    attachTranslatorUI(textBlock);
-
-    if (settings.autoTranslate) {
-      translateAndRender(textBlock);
-    }
-  }
+  bindTranslatableNodes(document.querySelectorAll('[data-testid="tweetText"]'), {
+    showButton: true,
+    forceAutoTranslate: false
+  });
+  bindTranslatableNodes(findArticleCardTitleNodes(), {
+    showButton: false,
+    forceAutoTranslate: true,
+    placeAfterCardWrapper: true
+  });
 }
 
 function isChineseText(text) {
@@ -100,29 +90,83 @@ function isAdTweet(article) {
   return false;
 }
 
-function attachTranslatorUI(textBlock) {
+function findArticleCardTitleNodes() {
+  const titleNodes = new Set();
+  const mediaCards = document.querySelectorAll('[data-testid="card.layoutLarge.media"]');
+
+  for (const card of mediaCards) {
+    const candidates = card.querySelectorAll('div[dir="ltr"]');
+    for (const node of candidates) {
+      const text = node.innerText?.trim() || '';
+      if (!text || text.length < 8) {
+        continue;
+      }
+
+      titleNodes.add(node);
+      break;
+    }
+  }
+
+  return titleNodes;
+}
+
+function bindTranslatableNodes(nodes, options) {
+  const { showButton = true, forceAutoTranslate = false, placeAfterCardWrapper = false } = options || {};
+
+  for (const textBlock of nodes) {
+    if (!textBlock || textBlock.dataset.xTranslateBound === '1') {
+      continue;
+    }
+
+    if (isChineseText(textBlock.innerText || '')) {
+      textBlock.dataset.xTranslateBound = '1';
+      continue;
+    }
+
+    textBlock.dataset.xTranslateBound = '1';
+    attachTranslatorUI(textBlock, { showButton, placeAfterCardWrapper });
+
+    if (forceAutoTranslate || settings.autoTranslate) {
+      translateAndRender(textBlock);
+    }
+  }
+}
+
+function attachTranslatorUI(textBlock, options) {
+  const { showButton = true, placeAfterCardWrapper = false } = options || {};
   const container = document.createElement('div');
   container.className = 'xt-translate-container';
-
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'xt-translate-btn';
-  button.textContent = 'Translate';
+  const containerId = `xt-translate-${Math.random().toString(36).slice(2, 10)}`;
+  container.dataset.containerId = containerId;
+  textBlock.dataset.xTranslateContainerId = containerId;
 
   const result = document.createElement('div');
   result.className = 'xt-translate-result';
   result.hidden = true;
 
-  button.addEventListener('click', () => translateAndRender(textBlock));
+  if (showButton) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'xt-translate-btn';
+    button.textContent = buildTranslateButtonText('');
+    button.addEventListener('click', () => translateAndRender(textBlock));
+    container.appendChild(button);
+  }
 
-  container.appendChild(button);
   container.appendChild(result);
-  textBlock.insertAdjacentElement('afterend', container);
+  const cardWrapper = placeAfterCardWrapper
+    ? textBlock.closest('[data-testid="card.wrapper"]')
+    : null;
+  const anchor = cardWrapper || textBlock;
+  anchor.insertAdjacentElement('afterend', container);
 }
 
 async function translateAndRender(textBlock) {
-  const container = textBlock.nextElementSibling;
-  if (!container?.classList.contains('xt-translate-container')) {
+  const containerId = textBlock.dataset.xTranslateContainerId || '';
+  const container = containerId
+    ? document.querySelector(`.xt-translate-container[data-container-id="${containerId}"]`)
+    : textBlock.nextElementSibling;
+  if (!container || !container.classList.contains('xt-translate-container')) {
     return;
   }
 
@@ -136,11 +180,14 @@ async function translateAndRender(textBlock) {
 
   if (container.dataset.lastSource === text && result.textContent) {
     result.hidden = false;
+    button.textContent = buildTranslateButtonText(container.dataset.providerLabel || '');
     return;
   }
 
-  button.disabled = true;
-  button.textContent = 'Translating...';
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Translating...';
+  }
 
   try {
     const response = await chrome.runtime.sendMessage({
@@ -154,13 +201,24 @@ async function translateAndRender(textBlock) {
     }
 
     container.dataset.lastSource = text;
+    container.dataset.providerLabel = response.providerLabel || '';
     result.textContent = response.translatedText;
     result.hidden = false;
   } catch (error) {
     result.textContent = `Translation error: ${error.message}`;
     result.hidden = false;
   } finally {
-    button.disabled = false;
-    button.textContent = 'Translate';
+    if (button) {
+      button.disabled = false;
+      button.textContent = buildTranslateButtonText(container.dataset.providerLabel || '');
+    }
   }
+}
+
+function buildTranslateButtonText(providerLabel) {
+  if (!providerLabel) {
+    return 'X-Tweet-Translator';
+  }
+
+  return `X-Tweet-Translator·${providerLabel}`;
 }
