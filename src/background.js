@@ -12,6 +12,7 @@ const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
 const GROK_WEB_URL = 'https://grok.com/';
 const GROK_INJECTION_RETRY = 8;
 const GROK_INJECTION_RETRY_INTERVAL_MS = 700;
+const GROK_IMAGE_UPLOAD_WAIT_MS = 3200;
 const CONTEXT_MENU_SEND_TEXT_TO_GROK = 'send-selection-to-grok';
 const CONTEXT_MENU_SEND_IMAGE_TO_GROK = 'send-image-to-grok';
 const TRANSLATION_PROVIDERS = [
@@ -38,7 +39,7 @@ chrome.runtime.onStartup.addListener(async () => {
 
 setupContextMenus().catch(() => {});
 
-chrome.contextMenus.onClicked.addListener(async (info) => {
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === CONTEXT_MENU_SEND_TEXT_TO_GROK) {
     const text = String(info.selectionText || '').trim();
     if (!text) {
@@ -55,8 +56,23 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
       return;
     }
 
-    const prompt = buildImagePrompt(srcUrl);
-    await openGrokAndInjectPrompt(prompt);
+    var imagePayload = await fetchImagePayload(srcUrl);
+    if (!imagePayload || !imagePayload.base64Data) {
+      return;
+    }
+
+    if (tab && tab.id) {
+      await copyImageToClipboard(tab.id, srcUrl, imagePayload);
+    }
+
+    const prompt = buildImagePrompt();
+    await openGrokAndInjectPrompt(prompt, {
+      pasteImageFromClipboard: true,
+      manualPasteOnly: false,
+      uploadWaitMs: GROK_IMAGE_UPLOAD_WAIT_MS,
+      imageBase64: imagePayload.base64Data,
+      imageMime: imagePayload.mimeType
+    });
   }
 });
 
@@ -90,7 +106,8 @@ async function setupContextMenus() {
   });
 }
 
-async function openGrokAndInjectPrompt(prompt) {
+async function openGrokAndInjectPrompt(prompt, options) {
+  const opts = options || {};
   const tab = await chrome.tabs.create({
     url: GROK_WEB_URL,
     active: true
@@ -101,8 +118,8 @@ async function openGrokAndInjectPrompt(prompt) {
   for (let i = 0; i < GROK_INJECTION_RETRY; i += 1) {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      args: [prompt],
-      func: function (text) {
+      args: [prompt, opts],
+      func: function (text, options) {
         var selectors = [
           '.tiptap.ProseMirror[contenteditable="true"]',
           '[contenteditable="true"].ProseMirror',
@@ -189,31 +206,36 @@ async function openGrokAndInjectPrompt(prompt) {
           return false;
         }
 
-        function trySubmit(el) {
-          if (el && typeof el.focus === 'function') {
-            el.focus();
-          }
+        function trySubmit(el, delayMs) {
+          var waitMs = typeof delayMs === 'number' ? delayMs : 0;
+          var safeWaitMs = waitMs > 0 ? waitMs : 0;
 
-          var eventInit = {
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            bubbles: true,
-            cancelable: true
-          };
+          setTimeout(function () {
+            if (el && typeof el.focus === 'function') {
+              el.focus();
+            }
 
-          el.dispatchEvent(new KeyboardEvent('keydown', eventInit));
-          el.dispatchEvent(new KeyboardEvent('keypress', eventInit));
-          el.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+            var eventInit = {
+              key: 'Enter',
+              code: 'Enter',
+              keyCode: 13,
+              which: 13,
+              bubbles: true,
+              cancelable: true
+            };
 
-          if (clickSubmitButton()) {
-            return;
-          }
+            el.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+            el.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+            el.dispatchEvent(new KeyboardEvent('keyup', eventInit));
 
-          for (var i = 0; i < 8; i += 1) {
-            setTimeout(clickSubmitButton, 250 * (i + 1));
-          }
+            if (clickSubmitButton()) {
+              return;
+            }
+
+            for (var i = 0; i < 10; i += 1) {
+              setTimeout(clickSubmitButton, 300 * (i + 1));
+            }
+          }, safeWaitMs);
         }
 
         var input = getInput();
@@ -221,13 +243,50 @@ async function openGrokAndInjectPrompt(prompt) {
           return false;
         }
 
+        var opts = options || {};
         var value = String(text || '');
-        if (!value) {
+        if (!value && !opts.pasteImageFromClipboard) {
           return false;
         }
 
         if (input && typeof input.focus === 'function') {
           input.focus();
+        }
+
+        function decodeBase64ToBytes(base64) {
+          var binary = atob(base64);
+          var len = binary.length;
+          var bytes = new Uint8Array(len);
+          for (var i = 0; i < len; i += 1) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          return bytes;
+        }
+
+        function attachImageViaFileInput(base64, mimeType) {
+          if (!base64) {
+            return false;
+          }
+
+          var fileInput = document.querySelector('input[type="file"]');
+          if (!fileInput) {
+            return false;
+          }
+
+          try {
+            var bytes = decodeBase64ToBytes(base64);
+            var mime = mimeType || 'image/png';
+            var ext = mime.indexOf('jpeg') !== -1 ? 'jpg' : (mime.split('/')[1] || 'png');
+            var fileName = 'x-tweet-translator-image.' + ext;
+            var file = new File([bytes], fileName, { type: mime });
+            var dt = new DataTransfer();
+            dt.items.add(file);
+            fileInput.files = dt.files;
+            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          } catch (e) {
+            return false;
+          }
         }
 
         var hasValueField = false;
@@ -237,19 +296,68 @@ async function openGrokAndInjectPrompt(prompt) {
           hasValueField = false;
         }
 
-        if (hasValueField) {
+        var textInserted = false;
+        if (hasValueField && value) {
           input.value = value;
           safeDispatchInputEvents(input, value);
-          trySubmit(input);
-          return true;
+          textInserted = true;
+        } else {
+          textInserted = value ? insertIntoContentEditable(input, value) : true;
         }
 
-        var inserted = insertIntoContentEditable(input, value);
-        if (inserted) {
-          trySubmit(input);
+        if (!textInserted) {
+          return false;
         }
 
-        return inserted;
+        var imageAttached = false;
+        if (opts.imageBase64) {
+          imageAttached = attachImageViaFileInput(opts.imageBase64, opts.imageMime);
+        }
+
+        if (!imageAttached && opts.pasteImageFromClipboard) {
+          var pasteEventInit = {
+            key: 'v',
+            code: 'KeyV',
+            keyCode: 86,
+            which: 86,
+            bubbles: true,
+            cancelable: true,
+            metaKey: true
+          };
+          input.dispatchEvent(new KeyboardEvent('keydown', pasteEventInit));
+          input.dispatchEvent(new KeyboardEvent('keypress', pasteEventInit));
+          input.dispatchEvent(new KeyboardEvent('keyup', pasteEventInit));
+
+          var ctrlPasteEventInit = {
+            key: 'v',
+            code: 'KeyV',
+            keyCode: 86,
+            which: 86,
+            bubbles: true,
+            cancelable: true,
+            ctrlKey: true
+          };
+          input.dispatchEvent(new KeyboardEvent('keydown', ctrlPasteEventInit));
+          input.dispatchEvent(new KeyboardEvent('keypress', ctrlPasteEventInit));
+          input.dispatchEvent(new KeyboardEvent('keyup', ctrlPasteEventInit));
+
+          try {
+            document.execCommand('paste');
+            imageAttached = true;
+          } catch (e) {}
+        }
+
+        if (textInserted) {
+          if (!opts.manualPasteOnly) {
+            if (opts.pasteImageFromClipboard || opts.imageBase64) {
+              trySubmit(input, opts.uploadWaitMs);
+            } else {
+              trySubmit(input, 0);
+            }
+          }
+        }
+
+        return textInserted;
       }
     });
 
@@ -259,6 +367,122 @@ async function openGrokAndInjectPrompt(prompt) {
 
     await sleep(GROK_INJECTION_RETRY_INTERVAL_MS);
   }
+}
+
+async function fetchImagePayload(srcUrl) {
+  if (!srcUrl) {
+    return null;
+  }
+
+  var response;
+  try {
+    response = await fetch(srcUrl, { method: 'GET', credentials: 'omit' });
+  } catch (e) {
+    return null;
+  }
+
+  if (!response || !response.ok) {
+    return null;
+  }
+
+  var blob;
+  try {
+    blob = await response.blob();
+  } catch (e) {
+    return null;
+  }
+
+  if (!blob || !blob.size) {
+    return null;
+  }
+
+  var mimeType = blob.type || 'image/png';
+  var buffer;
+  try {
+    buffer = await blob.arrayBuffer();
+  } catch (e) {
+    return null;
+  }
+
+  var base64Data;
+  try {
+    base64Data = arrayBufferToBase64(buffer);
+  } catch (e) {
+    return null;
+  }
+
+  return {
+    mimeType: mimeType,
+    base64Data: base64Data
+  };
+}
+
+async function copyImageToClipboard(sourceTabId, srcUrl, imagePayload) {
+  if (!sourceTabId || !srcUrl) {
+    return false;
+  }
+
+  var payload = imagePayload || await fetchImagePayload(srcUrl);
+  if (!payload || !payload.base64Data) {
+    return false;
+  }
+
+  var scriptResult = await chrome.scripting.executeScript({
+    target: { tabId: sourceTabId },
+    args: [payload.base64Data, payload.mimeType],
+    func: async function (base64, type) {
+      if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
+        return false;
+      }
+
+      try {
+        var binary = atob(base64);
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+
+        var mime = type || 'image/png';
+        var imageBlob = new Blob([bytes], { type: mime });
+        var itemData = {};
+        itemData[mime] = imageBlob;
+        await navigator.clipboard.write([new ClipboardItem(itemData)]);
+        return true;
+      } catch (e) {
+        try {
+          var binaryFallback = atob(base64);
+          var lenFallback = binaryFallback.length;
+          var bytesFallback = new Uint8Array(lenFallback);
+          for (var j = 0; j < lenFallback; j += 1) {
+            bytesFallback[j] = binaryFallback.charCodeAt(j);
+          }
+
+          var pngBlob = new Blob([bytesFallback], { type: 'image/png' });
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+          return true;
+        } catch (err) {
+          return false;
+        }
+      }
+    }
+  });
+
+  var first = scriptResult && scriptResult[0];
+  return !!(first && first.result);
+}
+
+function arrayBufferToBase64(buffer) {
+  var bytes = new Uint8Array(buffer);
+  var chunkSize = 0x8000;
+  var binary = '';
+
+  for (var i = 0; i < bytes.length; i += chunkSize) {
+    var chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+
+  return btoa(binary);
 }
 
 async function waitForTabReady(tabId) {
@@ -829,8 +1053,8 @@ function buildTextPrompt(text) {
   return `请介绍这个：\n${text}`;
 }
 
-function buildImagePrompt(srcUrl) {
-  return `请分析图片内容：\n${srcUrl}`;
+function buildImagePrompt() {
+  return '中文介绍图片内容。';
 }
 
 function getProviderLabel(providerId) {
