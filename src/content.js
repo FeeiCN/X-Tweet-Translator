@@ -57,7 +57,17 @@ async function scanTweets() {
 }
 
 function isChineseText(text) {
-  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(text);
+  const value = String(text || '');
+  if (!value) {
+    return false;
+  }
+
+  // Japanese text should not be treated as Chinese.
+  if (/[\u3040-\u30ff]/.test(value)) {
+    return false;
+  }
+
+  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(value);
 }
 
 function hideAdTweets() {
