@@ -52,6 +52,9 @@
 
 > 规则：每次 `manifest.json` 版本号变更时，必须同步更新本节。
 
+### v0.1.39
+- 右键菜单文案优化：`Send selected text to Grok` 改为 `使用Grok分析选定文字`
+
 ### v0.1.38
 - 右键菜单文案优化：`Send image to Grok` 改为 `让Grok分析图片内容`
 

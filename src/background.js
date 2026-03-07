@@ -95,7 +95,7 @@ async function setupContextMenus() {
 
   chrome.contextMenus.create({
     id: CONTEXT_MENU_SEND_TEXT_TO_GROK,
-    title: 'Send selected text to Grok',
+    title: '使用Grok分析选定文字',
     contexts: ['selection']
   });
 
