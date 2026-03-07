@@ -9,6 +9,11 @@ const REQUEST_MIN_INTERVAL_MS = 800;
 const MAX_RETRY_ATTEMPTS = 2;
 const RETRY_BASE_DELAY_MS = 1200;
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
+const GROK_WEB_URL = 'https://grok.com/';
+const GROK_INJECTION_RETRY = 8;
+const GROK_INJECTION_RETRY_INTERVAL_MS = 700;
+const CONTEXT_MENU_SEND_TEXT_TO_GROK = 'send-selection-to-grok';
+const CONTEXT_MENU_SEND_IMAGE_TO_GROK = 'send-image-to-grok';
 const TRANSLATION_PROVIDERS = [
   { id: 'mymemory' },
   { id: 'googlegtx' },
@@ -24,10 +29,39 @@ let currentProviderIndex = 0;
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.sync.get(DEFAULT_SETTINGS);
   await chrome.storage.sync.set({ ...DEFAULT_SETTINGS, ...current });
+  await setupContextMenus();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await setupContextMenus();
+});
+
+setupContextMenus().catch(() => {});
+
+chrome.contextMenus.onClicked.addListener(async (info) => {
+  if (info.menuItemId === CONTEXT_MENU_SEND_TEXT_TO_GROK) {
+    const text = String(info.selectionText || '').trim();
+    if (!text) {
+      return;
+    }
+
+    await openGrokAndInjectPrompt(buildTextPrompt(text));
+    return;
+  }
+
+  if (info.menuItemId === CONTEXT_MENU_SEND_IMAGE_TO_GROK) {
+    const srcUrl = String(info.srcUrl || '').trim();
+    if (!srcUrl) {
+      return;
+    }
+
+    const prompt = buildImagePrompt(srcUrl);
+    await openGrokAndInjectPrompt(prompt);
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'translate') {
+  if (!message || message.type !== 'translate') {
     return;
   }
 
@@ -39,6 +73,229 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+
+async function setupContextMenus() {
+  await chrome.contextMenus.removeAll();
+
+  chrome.contextMenus.create({
+    id: CONTEXT_MENU_SEND_TEXT_TO_GROK,
+    title: 'Send selected text to Grok',
+    contexts: ['selection']
+  });
+
+  chrome.contextMenus.create({
+    id: CONTEXT_MENU_SEND_IMAGE_TO_GROK,
+    title: 'Send image to Grok',
+    contexts: ['image']
+  });
+}
+
+async function openGrokAndInjectPrompt(prompt) {
+  const tab = await chrome.tabs.create({
+    url: GROK_WEB_URL,
+    active: true
+  });
+
+  await waitForTabReady(tab.id);
+
+  for (let i = 0; i < GROK_INJECTION_RETRY; i += 1) {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [prompt],
+      func: function (text) {
+        var selectors = [
+          '.tiptap.ProseMirror[contenteditable="true"]',
+          '[contenteditable="true"].ProseMirror',
+          'div[contenteditable="true"][translate="no"]',
+          'textarea',
+          'div[role="textbox"]'
+        ];
+
+        function getInput() {
+          for (var i = 0; i < selectors.length; i += 1) {
+            var node = document.querySelector(selectors[i]);
+            if (node) {
+              return node;
+            }
+          }
+          return null;
+        }
+
+        function safeDispatchInputEvents(el, value) {
+          try {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+              bubbles: true,
+              cancelable: true,
+              data: value,
+              inputType: 'insertText'
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              data: value,
+              inputType: 'insertText'
+            }));
+          } catch (e) {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        function insertIntoContentEditable(el, value) {
+          if (el && typeof el.focus === 'function') {
+            el.focus();
+          }
+
+          var selection = window.getSelection();
+          if (!selection) {
+            return false;
+          }
+
+          selection.removeAllRanges();
+          var range = document.createRange();
+          range.selectNodeContents(el);
+          range.collapse(false);
+          selection.addRange(range);
+
+          var inserted = false;
+          try {
+            inserted = document.execCommand('insertText', false, value);
+          } catch (e) {
+            inserted = false;
+          }
+
+          if (!inserted) {
+            el.textContent = value;
+          }
+
+          safeDispatchInputEvents(el, value);
+          return true;
+        }
+
+        function clickSubmitButton() {
+          var buttonSelectors = [
+            'button[aria-label="Submit"]:not([disabled])',
+            'button[type="submit"]:not([disabled])',
+            'button[data-testid="send-button"]:not([disabled])'
+          ];
+
+          for (var i = 0; i < buttonSelectors.length; i += 1) {
+            var button = document.querySelector(buttonSelectors[i]);
+            if (button && typeof button.click === 'function') {
+              button.click();
+              return true;
+            }
+          }
+
+          return false;
+        }
+
+        function trySubmit(el) {
+          if (el && typeof el.focus === 'function') {
+            el.focus();
+          }
+
+          var eventInit = {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true
+          };
+
+          el.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+          el.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+          el.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+
+          if (clickSubmitButton()) {
+            return;
+          }
+
+          for (var i = 0; i < 8; i += 1) {
+            setTimeout(clickSubmitButton, 250 * (i + 1));
+          }
+        }
+
+        var input = getInput();
+        if (!input) {
+          return false;
+        }
+
+        var value = String(text || '');
+        if (!value) {
+          return false;
+        }
+
+        if (input && typeof input.focus === 'function') {
+          input.focus();
+        }
+
+        var hasValueField = false;
+        try {
+          hasValueField = input && ('value' in input);
+        } catch (e) {
+          hasValueField = false;
+        }
+
+        if (hasValueField) {
+          input.value = value;
+          safeDispatchInputEvents(input, value);
+          trySubmit(input);
+          return true;
+        }
+
+        var inserted = insertIntoContentEditable(input, value);
+        if (inserted) {
+          trySubmit(input);
+        }
+
+        return inserted;
+      }
+    });
+
+    if (result && result.result) {
+      return;
+    }
+
+    await sleep(GROK_INJECTION_RETRY_INTERVAL_MS);
+  }
+}
+
+async function waitForTabReady(tabId) {
+  if (!tabId) {
+    return;
+  }
+
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.status === 'complete') {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, 10000);
+
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId || changeInfo.status !== 'complete' || settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
 
 async function translateText({ text, sourceLanguage = '', targetLanguage = 'zh-CN' }) {
   const cleanText = String(text || '').replace(/\s+/g, ' ').trim();
@@ -134,7 +391,7 @@ async function fetchAndCacheTranslation({
         providerLabel: getProviderLabel(provider.id)
       };
     } catch (error) {
-      if (error?.isRateLimited) {
+      if (error && error.isRateLimited) {
         const cooldownMs = error.retryAfterMs || RATE_LIMIT_COOLDOWN_MS;
         setProviderCooldown(provider.id, cooldownMs);
         errors.push(`${provider.id}: ${buildRateLimitMessage(cooldownMs)}`);
@@ -171,7 +428,7 @@ async function runProviderWithRetries({
       });
     } catch (error) {
       lastError = error;
-      if (error?.isRateLimited) {
+      if (error && error.isRateLimited) {
         throw error;
       }
 
@@ -210,7 +467,7 @@ function getRetryDelayMs(attempt) {
 }
 
 function isRetryableError(error) {
-  const message = String(error?.message || '');
+  const message = String((error && error.message) || '');
   return (
     message.startsWith('HTTP 5') ||
     message.startsWith('HTTP 429') ||
@@ -283,21 +540,23 @@ async function requestMyMemory({
   }
 
   const data = await response.json();
-  const responseStatus = Number(data?.responseStatus || 0);
+  const responseStatus = Number((data && data.responseStatus) || 0);
   if (responseStatus === 429) {
     throw rateLimitError(RATE_LIMIT_COOLDOWN_MS);
   }
 
-  const responseDetails = String(data?.responseDetails || '');
+  const responseDetails = String((data && data.responseDetails) || '');
   if (/quota exceeded|too many requests|rate limit/i.test(responseDetails)) {
     throw rateLimitError(RATE_LIMIT_COOLDOWN_MS);
   }
 
   if (responseStatus >= 400) {
-    throw new Error(data?.responseDetails || `API error ${responseStatus}`);
+    throw new Error((data && data.responseDetails) || `API error ${responseStatus}`);
   }
 
-  const translatedText = data?.responseData?.translatedText?.trim();
+  const translatedText = String(
+    (data && data.responseData && data.responseData.translatedText) || ''
+  ).trim();
   if (!translatedText) {
     throw new Error('No translated text returned');
   }
@@ -334,7 +593,7 @@ async function requestLibreTranslate({
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
   if (response.status === 400 && contentType.includes('application/json')) {
     const data = await response.json();
-    const errorText = String(data?.error || '').trim();
+    const errorText = String((data && data.error) || '').trim();
     throw new Error(errorText || 'HTTP 400');
   }
 
@@ -343,9 +602,9 @@ async function requestLibreTranslate({
   }
 
   const data = await response.json();
-  const translatedText = String(data?.translatedText || '').trim();
+  const translatedText = String((data && data.translatedText) || '').trim();
   if (!translatedText) {
-    const errorText = String(data?.error || '').trim();
+    const errorText = String((data && data.error) || '').trim();
     if (/too many requests|rate limit/i.test(errorText)) {
       throw rateLimitError(RATE_LIMIT_COOLDOWN_MS);
     }
@@ -386,7 +645,7 @@ async function requestGoogleGTX({
   }
 
   const data = await response.json();
-  const segments = Array.isArray(data?.[0]) ? data[0] : [];
+  const segments = Array.isArray(data && data[0]) ? data[0] : [];
   const translatedText = segments
     .map((segment) => (Array.isArray(segment) ? String(segment[0] || '') : ''))
     .join('')
@@ -456,7 +715,7 @@ function simpleHash(input) {
 
 async function getCachedTranslation(cacheKey) {
   const stored = await chrome.storage.local.get(cacheKey);
-  const record = stored?.[cacheKey];
+  const record = stored && stored[cacheKey];
   if (!record) {
     return '';
   }
@@ -469,7 +728,7 @@ async function getCachedTranslation(cacheKey) {
     };
   }
 
-  if (!record?.value || typeof record?.createdAt !== 'number') {
+  if (!record || !record.value || typeof record.createdAt !== 'number') {
     return '';
   }
 
@@ -564,6 +823,14 @@ function mapLanguageForGoogle(languageCode) {
   }
 
   return normalized;
+}
+
+function buildTextPrompt(text) {
+  return `请介绍这个：\n${text}`;
+}
+
+function buildImagePrompt(srcUrl) {
+  return `请分析图片内容：\n${srcUrl}`;
 }
 
 function getProviderLabel(providerId) {

@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "X Tweet Translator",
   "description": "Translate tweets on X directly in the timeline.",
-  "version": "0.1.14",
-  "permissions": ["storage"],
+  "version": "0.1.28",
+  "permissions": ["storage", "contextMenus", "tabs", "scripting"],
   "icons": {
     "16": "src/icons/icon16.png",
     "32": "src/icons/icon32.png",
@@ -15,7 +15,8 @@
     "https://twitter.com/*",
     "https://api.mymemory.translated.net/*",
     "https://libretranslate.com/*",
-    "https://translate.googleapis.com/*"
+    "https://translate.googleapis.com/*",
+    "https://grok.com/*"
   ],
   "background": {
     "service_worker": "src/background.js",
