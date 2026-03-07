@@ -2,9 +2,11 @@
 
 一个用于在 X（Twitter）时间线上翻译推文的 Chrome 插件 MVP。
 
+> 本项目为 AI Coding 实践项目，基于 OpenAI Codex（GPT-5.3-Codex）完成开发与迭代。
+
 ## 图片预览
 
-![X Tweet Translator Screenshot](/Users/feei/Documents/auto-translate/ScreenShot_X-Tweet-Translator.png)
+![X Tweet Translator Screenshot](./ScreenShot_X-Tweet-Translator.png)
 
 ## 当前功能
 
@@ -33,12 +35,7 @@
 1. 打开 Chrome，进入 `chrome://extensions`
 2. 打开右上角 `开发者模式`
 3. 点击 `加载已解压的扩展程序`
-4. 选择本项目目录：
-
-```text
-/Users/feei/Documents/auto-translate
-```
-
+4. 选择本项目目录
 5. 打开 `https://x.com` 验证效果
 
 ## Changelog
@@ -78,5 +75,5 @@
 
 ## 合规与上架文档
 
-- 隐私政策草案：[PRIVACY.md](/Users/feei/Documents/auto-translate/PRIVACY.md)
-- Chrome Web Store 上架文案草案：[STORE_LISTING.md](/Users/feei/Documents/auto-translate/STORE_LISTING.md)
+- 隐私政策草案：[PRIVACY.md](./PRIVACY.md)
+- Chrome Web Store 上架文案草案：[STORE_LISTING.md](./STORE_LISTING.md)
