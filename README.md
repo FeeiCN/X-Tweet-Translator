@@ -2,6 +2,10 @@
 
 一个用于在 X（Twitter）时间线上翻译推文的 Chrome 插件 MVP。
 
+## 图片预览
+
+![X Tweet Translator Screenshot](/Users/feei/Documents/auto-translate/ScreenShot_X-Tweet-Translator.png)
+
 ## 当前功能
 
 - 自动识别页面中的推文正文（`data-testid="tweetText"`）
