@@ -13,6 +13,12 @@ const GROK_WEB_URL = 'https://grok.com/';
 const GROK_INJECTION_RETRY = 8;
 const GROK_INJECTION_RETRY_INTERVAL_MS = 700;
 const GROK_IMAGE_UPLOAD_WAIT_MS = 3200;
+const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+const IMAGE_RESIZE_STEPS = [
+  { maxDimension: 2048, quality: 0.85 },
+  { maxDimension: 1600, quality: 0.74 },
+  { maxDimension: 1280, quality: 0.64 }
+];
 const CONTEXT_MENU_SEND_TEXT_TO_GROK = 'send-selection-to-grok';
 const CONTEXT_MENU_SEND_IMAGE_TO_GROK = 'send-image-to-grok';
 const TRANSLATION_PROVIDERS = [
@@ -58,6 +64,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     var imagePayload = await fetchImagePayload(srcUrl);
     if (!imagePayload || !imagePayload.base64Data) {
+      console.warn('[X Tweet Translator] Skip image to Grok: payload unavailable or too large.');
       return;
     }
 
@@ -396,10 +403,15 @@ async function fetchImagePayload(srcUrl) {
     return null;
   }
 
-  var mimeType = blob.type || 'image/png';
+  var preparedBlob = await prepareImageBlobForTransport(blob);
+  if (!preparedBlob || !preparedBlob.size || preparedBlob.size > MAX_IMAGE_BYTES) {
+    return null;
+  }
+
+  var mimeType = preparedBlob.type || 'image/jpeg';
   var buffer;
   try {
-    buffer = await blob.arrayBuffer();
+    buffer = await preparedBlob.arrayBuffer();
   } catch (e) {
     return null;
   }
@@ -415,6 +427,86 @@ async function fetchImagePayload(srcUrl) {
     mimeType: mimeType,
     base64Data: base64Data
   };
+}
+
+async function prepareImageBlobForTransport(blob) {
+  if (!blob || !blob.size) {
+    return null;
+  }
+
+  if (blob.size <= MAX_IMAGE_BYTES) {
+    return blob;
+  }
+
+  var currentBlob = blob;
+  for (const step of IMAGE_RESIZE_STEPS) {
+    const resizedBlob = await resizeImageBlob(currentBlob, step);
+    if (!resizedBlob || !resizedBlob.size) {
+      continue;
+    }
+
+    if (resizedBlob.size < currentBlob.size) {
+      currentBlob = resizedBlob;
+    }
+
+    if (currentBlob.size <= MAX_IMAGE_BYTES) {
+      return currentBlob;
+    }
+  }
+
+  return null;
+}
+
+async function resizeImageBlob(blob, options) {
+  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') {
+    return null;
+  }
+
+  var settings = options || {};
+  var maxDimension = Number(settings.maxDimension) || 1600;
+  var quality = Number(settings.quality);
+  if (!Number.isFinite(quality)) {
+    quality = 0.8;
+  }
+
+  var imageBitmap;
+  try {
+    imageBitmap = await createImageBitmap(blob);
+  } catch (e) {
+    return null;
+  }
+
+  try {
+    var width = imageBitmap.width || 0;
+    var height = imageBitmap.height || 0;
+    if (!width || !height) {
+      return null;
+    }
+
+    var longestSide = Math.max(width, height);
+    var scale = longestSide > maxDimension ? maxDimension / longestSide : 1;
+    var targetWidth = Math.max(1, Math.round(width * scale));
+    var targetHeight = Math.max(1, Math.round(height * scale));
+
+    var canvas = new OffscreenCanvas(targetWidth, targetHeight);
+    var context = canvas.getContext('2d', { alpha: false });
+    if (!context) {
+      return null;
+    }
+
+    context.drawImage(imageBitmap, 0, 0, targetWidth, targetHeight);
+    var safeQuality = Math.min(0.95, Math.max(0.3, quality));
+    return await canvas.convertToBlob({
+      type: 'image/jpeg',
+      quality: safeQuality
+    });
+  } catch (e) {
+    return null;
+  } finally {
+    if (imageBitmap && typeof imageBitmap.close === 'function') {
+      imageBitmap.close();
+    }
+  }
 }
 
 async function copyImageToClipboard(sourceTabId, srcUrl, imagePayload) {
@@ -532,9 +624,11 @@ async function translateText({ text, sourceLanguage = '', targetLanguage = 'zh-C
   const normalizedTarget = normalizeLanguageCode(targetLanguage) || 'zh-CN';
   const normalizedSource =
     normalizeLanguageCode(sourceLanguage) ||
-    detectSourceLanguage(safeText);
+    detectSourceLanguage(safeText) ||
+    '';
+  const sourceForCache = normalizedSource || 'auto';
 
-  if (normalizedSource.toLowerCase().startsWith('zh')) {
+  if (normalizedSource && normalizedSource.toLowerCase().startsWith('zh')) {
     return {
       translatedText: safeText,
       providerId: 'local',
@@ -542,7 +636,7 @@ async function translateText({ text, sourceLanguage = '', targetLanguage = 'zh-C
     };
   }
 
-  if (normalizedSource.toLowerCase() === normalizedTarget.toLowerCase()) {
+  if (normalizedSource && normalizedSource.toLowerCase() === normalizedTarget.toLowerCase()) {
     return {
       translatedText: safeText,
       providerId: 'local',
@@ -551,12 +645,18 @@ async function translateText({ text, sourceLanguage = '', targetLanguage = 'zh-C
   }
 
   const cacheKey = buildCacheKey({
-    sourceLanguage: normalizedSource,
+    sourceLanguage: sourceForCache,
     targetLanguage: normalizedTarget,
     text: safeText
   });
 
-  const cached = await getCachedTranslation(cacheKey);
+  let cached = '';
+  try {
+    cached = await getCachedTranslation(cacheKey);
+  } catch (error) {
+    console.warn('[X Tweet Translator] Failed to read translation cache:', error);
+  }
+
   if (cached) {
     const cachedProviderId = cached.providerId || 'mymemory';
     return {
@@ -589,7 +689,7 @@ async function fetchAndCacheTranslation({
   normalizedSource,
   normalizedTarget
 }) {
-  const providers = getProviderOrder();
+  const providers = getProviderOrder(normalizedSource);
   const errors = [];
 
   for (const provider of providers) {
@@ -608,7 +708,11 @@ async function fetchAndCacheTranslation({
       });
 
       currentProviderIndex = TRANSLATION_PROVIDERS.findIndex((item) => item.id === provider.id);
-      await setCachedTranslation(cacheKey, translatedText, provider.id);
+      try {
+        await setCachedTranslation(cacheKey, translatedText, provider.id);
+      } catch (cacheError) {
+        console.warn('[X Tweet Translator] Failed to write translation cache:', cacheError);
+      }
       return {
         translatedText,
         providerId: provider.id,
@@ -744,9 +848,15 @@ async function requestMyMemory({
   normalizedSource,
   normalizedTarget
 }) {
+  const source = mapLanguageForMyMemory(normalizedSource);
+  const target = mapLanguageForMyMemory(normalizedTarget);
+  if (!source || !target) {
+    throw new Error('MyMemory requires explicit source and target languages');
+  }
+
   const url = new URL('https://api.mymemory.translated.net/get');
   url.searchParams.set('q', safeText);
-  url.searchParams.set('langpair', `${normalizedSource}|${normalizedTarget}`);
+  url.searchParams.set('langpair', `${source}|${target}`);
 
   const response = await fetch(url, {
     method: 'GET',
@@ -902,10 +1012,27 @@ function rateLimitError(retryAfterMs) {
   return error;
 }
 
-function getProviderOrder() {
+function getProviderOrder(sourceLanguage = '') {
   const size = TRANSLATION_PROVIDERS.length;
+  if (size === 0) {
+    return [];
+  }
+
   const start = ((currentProviderIndex % size) + size) % size;
   const ordered = [];
+  const hasSourceLanguage = !!normalizeLanguageCode(sourceLanguage);
+
+  for (let i = 0; i < size; i += 1) {
+    const provider = TRANSLATION_PROVIDERS[(start + i) % size];
+    if (!hasSourceLanguage && provider.id === 'mymemory') {
+      continue;
+    }
+    ordered.push(provider);
+  }
+
+  if (ordered.length > 0) {
+    return ordered;
+  }
 
   for (let i = 0; i < size; i += 1) {
     ordered.push(TRANSLATION_PROVIDERS[(start + i) % size]);
@@ -1020,7 +1147,40 @@ function detectSourceLanguage(text) {
     return 'ru';
   }
 
-  return 'en';
+  if (/[\u0600-\u06ff]/.test(text)) {
+    return 'ar';
+  }
+
+  if (/[\u0590-\u05ff]/.test(text)) {
+    return 'he';
+  }
+
+  if (/[\u0e00-\u0e7f]/.test(text)) {
+    return 'th';
+  }
+
+  if (/[\u0900-\u097f]/.test(text)) {
+    return 'hi';
+  }
+
+  if (/[a-zA-Z]/.test(text)) {
+    return 'en';
+  }
+
+  return '';
+}
+
+function mapLanguageForMyMemory(languageCode) {
+  const normalized = normalizeLanguageCode(languageCode);
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.startsWith('zh')) {
+    return normalized.includes('-') ? normalized : 'zh-CN';
+  }
+
+  return normalized;
 }
 
 function mapLanguageForLibreTranslate(languageCode) {

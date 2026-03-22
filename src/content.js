@@ -3,14 +3,21 @@ const DEFAULT_SETTINGS = {
   autoTranslate: true,
   targetLanguage: 'zh-CN'
 };
+const TWEET_TEXT_SELECTOR = '[data-testid="tweetText"]';
+const MEDIA_CARD_SELECTOR = '[data-testid="card.layoutLarge.media"]';
+const AD_TWEET_SELECTOR = 'article[data-testid="tweet"]';
+const SCAN_DEBOUNCE_MS = 180;
 
 let settings = { ...DEFAULT_SETTINGS };
+let timelineObserver = null;
+let scanTimer = 0;
+const pendingScanRoots = new Set();
 
 init();
 
 async function init() {
   settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  scanTweets();
+  queueScan(document.body || document.documentElement);
   observeTimeline();
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -18,38 +25,122 @@ async function init() {
       return;
     }
 
+    const previousSettings = { ...settings };
     for (const [key, value] of Object.entries(changes)) {
       settings[key] = value.newValue;
     }
 
-    scanTweets();
+    if (!settings.enabled) {
+      cleanupInjectedUI();
+      return;
+    }
+
+    queueScan(document.body || document.documentElement);
+
+    const targetLanguageChanged = previousSettings.targetLanguage !== settings.targetLanguage;
+    const autoTranslateEnabledNow = !previousSettings.autoTranslate && settings.autoTranslate;
+    if ((autoTranslateEnabledNow || targetLanguageChanged) && settings.autoTranslate) {
+      autoTranslateBoundNodes();
+    }
   });
 }
 
 function observeTimeline() {
-  const observer = new MutationObserver(() => {
-    window.clearTimeout(observeTimeline.timer);
-    observeTimeline.timer = window.setTimeout(scanTweets, 250);
+  if (timelineObserver) {
+    return;
+  }
+
+  if (!document.body) {
+    window.setTimeout(observeTimeline, 200);
+    return;
+  }
+
+  timelineObserver = new MutationObserver((mutations) => {
+    if (!settings.enabled) {
+      return;
+    }
+
+    for (const mutation of mutations) {
+      queueScan(mutation.target);
+      for (const node of mutation.addedNodes) {
+        queueScan(node);
+      }
+    }
   });
 
-  observer.observe(document.body, {
+  timelineObserver.observe(document.body, {
     childList: true,
     subtree: true
   });
 }
 
-async function scanTweets() {
-  if (!settings.enabled) {
+function queueScan(root) {
+  const normalizedRoot = normalizeRoot(root);
+  if (!normalizedRoot) {
     return;
   }
 
-  hideAdTweets();
+  pendingScanRoots.add(normalizedRoot);
+  window.clearTimeout(scanTimer);
+  scanTimer = window.setTimeout(processPendingScans, SCAN_DEBOUNCE_MS);
+}
 
-  bindTranslatableNodes(document.querySelectorAll('[data-testid="tweetText"]'), {
+function processPendingScans() {
+  scanTimer = 0;
+  if (!settings.enabled) {
+    pendingScanRoots.clear();
+    return;
+  }
+
+  const roots = Array.from(pendingScanRoots);
+  pendingScanRoots.clear();
+
+  for (const root of roots) {
+    scanRoot(root);
+  }
+}
+
+function normalizeRoot(root) {
+  if (!root) {
+    return null;
+  }
+
+  if (root === document) {
+    return document.body || document.documentElement;
+  }
+
+  if (root.nodeType === Node.TEXT_NODE) {
+    return root.parentElement;
+  }
+
+  if (root.nodeType === Node.DOCUMENT_NODE) {
+    return document.body || document.documentElement;
+  }
+
+  if (root instanceof Element || root instanceof DocumentFragment) {
+    return root;
+  }
+
+  return null;
+}
+
+function scanRoot(root) {
+  if (!root) {
+    return;
+  }
+
+  if (root instanceof Element && !root.isConnected) {
+    return;
+  }
+
+  hideAdTweets(root);
+
+  bindTranslatableNodes(findNodesBySelector(root, TWEET_TEXT_SELECTOR), {
     showButton: true,
     forceAutoTranslate: false
   });
-  bindTranslatableNodes(findArticleCardTitleNodes(), {
+
+  bindTranslatableNodes(findArticleCardTitleNodes(root), {
     showButton: false,
     forceAutoTranslate: true,
     placeAfterCardWrapper: true
@@ -70,8 +161,8 @@ function isChineseText(text) {
   return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(value);
 }
 
-function hideAdTweets() {
-  const tweetArticles = document.querySelectorAll('article[data-testid="tweet"]');
+function hideAdTweets(root) {
+  const tweetArticles = findNodesBySelector(root, AD_TWEET_SELECTOR);
 
   for (const article of tweetArticles) {
     if (article.dataset.xAdHidden === '1') {
@@ -84,6 +175,8 @@ function hideAdTweets() {
 
     article.dataset.xAdHidden = '1';
     const wrapper = article.closest('div[data-testid="cellInnerDiv"]') || article;
+    wrapper.dataset.xAdHiddenWrapper = '1';
+    wrapper.dataset.xAdOriginalDisplay = wrapper.style.display || '';
     wrapper.style.display = 'none';
   }
 }
@@ -100,9 +193,9 @@ function isAdTweet(article) {
   return false;
 }
 
-function findArticleCardTitleNodes() {
+function findArticleCardTitleNodes(root) {
   const titleNodes = new Set();
-  const mediaCards = document.querySelectorAll('[data-testid="card.layoutLarge.media"]');
+  const mediaCards = findNodesBySelector(root, MEDIA_CARD_SELECTOR);
 
   for (const card of mediaCards) {
     const candidates = card.querySelectorAll('div[dir="ltr"]');
@@ -120,11 +213,32 @@ function findArticleCardTitleNodes() {
   return titleNodes;
 }
 
+function findNodesBySelector(root, selector) {
+  const nodes = new Set();
+  if (!root || typeof selector !== 'string') {
+    return nodes;
+  }
+
+  if (root instanceof Element && root.matches(selector)) {
+    nodes.add(root);
+  }
+
+  if (typeof root.querySelectorAll !== 'function') {
+    return nodes;
+  }
+
+  for (const node of root.querySelectorAll(selector)) {
+    nodes.add(node);
+  }
+
+  return nodes;
+}
+
 function bindTranslatableNodes(nodes, options) {
   const { showButton = true, forceAutoTranslate = false, placeAfterCardWrapper = false } = options || {};
 
   for (const textBlock of nodes) {
-    if (!textBlock || textBlock.dataset.xTranslateBound === '1') {
+    if (!textBlock || !(textBlock instanceof Element) || textBlock.dataset.xTranslateBound === '1') {
       continue;
     }
 
@@ -188,11 +302,23 @@ async function translateAndRender(textBlock) {
     return;
   }
 
-  if (container.dataset.lastSource === text && result.textContent) {
+  if (
+    container.dataset.lastSource === text &&
+    container.dataset.lastTargetLanguage === settings.targetLanguage &&
+    result.textContent
+  ) {
     result.hidden = false;
-    button.textContent = buildTranslateButtonText(container.dataset.providerLabel || '');
+    if (button) {
+      button.textContent = buildTranslateButtonText(container.dataset.providerLabel || '');
+    }
     return;
   }
+
+  if (container.dataset.loading === '1') {
+    return;
+  }
+
+  container.dataset.loading = '1';
 
   if (button) {
     button.disabled = true;
@@ -211,6 +337,7 @@ async function translateAndRender(textBlock) {
     }
 
     container.dataset.lastSource = text;
+    container.dataset.lastTargetLanguage = settings.targetLanguage;
     container.dataset.providerLabel = response.providerLabel || '';
     result.textContent = response.translatedText;
     result.hidden = false;
@@ -218,6 +345,7 @@ async function translateAndRender(textBlock) {
     result.textContent = `Translation error: ${error.message}`;
     result.hidden = false;
   } finally {
+    delete container.dataset.loading;
     if (button) {
       button.disabled = false;
       button.textContent = buildTranslateButtonText(container.dataset.providerLabel || '');
@@ -231,4 +359,45 @@ function buildTranslateButtonText(providerLabel) {
   }
 
   return `X-Tweet-Translator·${providerLabel}`;
+}
+
+function cleanupInjectedUI() {
+  pendingScanRoots.clear();
+  window.clearTimeout(scanTimer);
+  scanTimer = 0;
+
+  for (const wrapper of document.querySelectorAll('[data-x-ad-hidden-wrapper="1"]')) {
+    const originalDisplay = wrapper.dataset.xAdOriginalDisplay || '';
+    if (originalDisplay) {
+      wrapper.style.display = originalDisplay;
+    } else {
+      wrapper.style.removeProperty('display');
+    }
+    delete wrapper.dataset.xAdHiddenWrapper;
+    delete wrapper.dataset.xAdOriginalDisplay;
+  }
+
+  for (const article of document.querySelectorAll('article[data-x-ad-hidden="1"]')) {
+    delete article.dataset.xAdHidden;
+  }
+
+  for (const container of document.querySelectorAll('.xt-translate-container')) {
+    container.remove();
+  }
+
+  for (const node of document.querySelectorAll('[data-x-translate-bound], [data-x-translate-container-id]')) {
+    delete node.dataset.xTranslateBound;
+    delete node.dataset.xTranslateContainerId;
+  }
+}
+
+function autoTranslateBoundNodes() {
+  if (!settings.enabled || !settings.autoTranslate) {
+    return;
+  }
+
+  const boundNodes = document.querySelectorAll('[data-x-translate-bound="1"][data-x-translate-container-id]');
+  for (const node of boundNodes) {
+    translateAndRender(node);
+  }
 }
